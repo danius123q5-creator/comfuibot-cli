@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comfuibot"
+version = "1.0.0"
+description = "console-side bot — консольный клиент к API ComfyBot: чат с ИИ, генерация и правка фото, кодер-агент"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "danius123q5-creator" }]
+keywords = ["ai", "cli", "telegram-bot", "image-generation", "llm"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Topic :: Multimedia :: Graphics",
+]
+# Зависимостей нет: только стандартная библиотека (urllib) — чтобы
+# `pip install git+…` вставал мгновенно и нигде не ломался.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/danius123q5-creator/comfuibot-cli"
+Bot = "https://t.me/comfuibot"
+
+[project.scripts]
+comfuibot = "comfuibot.cli:main"
+
+[tool.setuptools]
+packages = ["comfuibot"]
