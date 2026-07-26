@@ -68,6 +68,13 @@ def _getkey():
     """Прочитать одну клавишу (стрелки/Enter/Esc). Возвращает 'up','down',
     'enter','esc','back' или сам символ. Фоллбэк на input(), если терминал
     не поддерживает посимвольное чтение (пайп, IDE-консоль)."""
+    # Не-терминал (пайп, CI, IDE-консоль): посимвольное чтение зависнет —
+    # сразу уходим в нумерованный фоллбэк.
+    try:
+        if not sys.stdin.isatty():
+            return "fallback"
+    except Exception:
+        return "fallback"
     try:
         if os.name == "nt":
             import msvcrt
@@ -321,8 +328,17 @@ def cmd_api_auth(args):
         info = cl.keyinfo()
         if isinstance(info, dict) and not info.get("errorCode"):
             print(f"{C.GR}✓ ключ принят сервером{C.R}")
+            # Показываем, ЧТО за ключ: тариф, срок, лимиты — сразу, без лишней команды.
+            scope = info.get("scope", "")
+            if scope:
+                print(f"  {C.D}доступ: {scope} · истекает {info.get('expires_at_human','—')} "
+                      f"· лимит {info.get('daily_limit','—')}/день{C.R}")
     except ApiError as e:
         print(f"{C.YE}! проверить не удалось: {e}{C.R}")
+    # Сразу открываем меню — человек не должен гадать, что набирать дальше.
+    # (Пропускаем, если ключ передали аргументом: значит вызов скриптовый.)
+    if not getattr(args, "no_menu", False) and not args.key:
+        return cmd_menu(args)
     return 0
 
 
@@ -947,6 +963,8 @@ def build_parser():
     s.set_defaults(func=cmd_api_status)
     a = apisub.add_parser("auth", help="вставить/сменить API-ключ")
     a.add_argument("key", nargs="?", default="", help="ключ (иначе спросит)")
+    a.add_argument("--no-menu", action="store_true",
+                   help="не открывать меню после сохранения (для скриптов)")
     a.set_defaults(func=cmd_api_auth)
     u = apisub.add_parser("usage", help="тариф, срок, лимиты ключа")
     u.set_defaults(func=cmd_api_usage)
