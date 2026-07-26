@@ -27,6 +27,9 @@ Bot = "https://t.me/comfuibot"
 
 [project.scripts]
 comfuibot = "comfuibot.cli:main"
+# Алиас: тот же клиент можно звать «console-side» — как режим работы бота
+# со стороны консоли (TG-side ↔ console-side).
+console-side = "comfuibot.cli:main"
 
 [tool.setuptools]
 packages = ["comfuibot"]

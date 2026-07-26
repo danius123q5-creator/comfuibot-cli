@@ -96,6 +96,11 @@ class Client:
         q = urllib.parse.quote(self.key)
         return _request("GET", f"{self.url}/v1/keyinfo?apiKey={q}", timeout=30)
 
+    def styles(self):
+        """Готовые персоны для чата (/v1/talk/styles)."""
+        r = _request("GET", f"{self.url}/v1/talk/styles", timeout=30)
+        return r if isinstance(r, dict) else {}
+
     # --- чат ---
     def talk(self, message, style="", system_prompt=""):
         body = {"apiKey": self.key, "message": message, "session_id": self.session}
@@ -120,9 +125,11 @@ class Client:
         if image_b64:
             body["image_base64"] = image_b64
         r = _request("POST", f"{self.url}/v1/generate", body, timeout=120)
-        jid = r.get("jobId") or r.get("id") or r.get("job_id")
+        # Сервер отдаёт идентификатор как request_id/requestId (jobId — легаси).
+        jid = (r.get("request_id") or r.get("requestId")
+               or r.get("jobId") or r.get("job_id") or r.get("id"))
         if not jid:
-            raise ApiError(f"нет jobId в ответе: {str(r)[:150]}")
+            raise ApiError(f"нет request_id в ответе: {str(r)[:150]}")
         return jid
 
     def status(self, job_id):
@@ -130,13 +137,31 @@ class Client:
         return _request("GET", f"{self.url}/v1/status/{job_id}?apiKey={q}", timeout=60)
 
     def result_bytes(self, job_id):
+        """Забрать готовый файл. Сервер отдаёт ЛИБО сами байты (Content-Type
+        image/*), ЛИБО JSON с resultUrl — тогда качаем по ссылке."""
         q = urllib.parse.quote(self.key)
         r = _request("GET", f"{self.url}/v1/result/{job_id}?apiKey={q}", timeout=180, raw=True)
         if isinstance(r, (bytes, bytearray)):
             return bytes(r)
-        b64 = (r or {}).get("image_base64") or (r or {}).get("image") or ""
+        r = r or {}
+        url = r.get("resultUrl") or r.get("result_url") or r.get("url")
+        if url:
+            # Ссылка может указывать на внутренний хост (API_BASE_URL) — если мы
+            # ходим на другой адрес, переклеим путь на наш базовый URL.
+            try:
+                p = urllib.parse.urlparse(url)
+                if p.netloc and p.netloc not in self.url:
+                    url = f"{self.url}{p.path}"
+            except Exception:
+                pass
+            sep = "&" if "?" in url else "?"
+            data = _request("GET", f"{url}{sep}apiKey={q}", timeout=180, raw=True)
+            if isinstance(data, (bytes, bytearray)):
+                return bytes(data)
+            raise ApiError(f"по resultUrl пришёл не файл: {str(data)[:120]}")
+        b64 = r.get("image_base64") or r.get("image") or ""
         if not b64:
-            raise ApiError((r or {}).get("message") or "нет картинки в ответе")
+            raise ApiError(r.get("message") or f"нет картинки в ответе: {str(r)[:120]}")
         if "," in b64[:64]:
             b64 = b64.split(",", 1)[1]
         return base64.b64decode(b64)

@@ -64,6 +64,185 @@ def _open(path):
         pass
 
 
+def _getkey():
+    """Прочитать одну клавишу (стрелки/Enter/Esc). Возвращает 'up','down',
+    'enter','esc','back' или сам символ. Фоллбэк на input(), если терминал
+    не поддерживает посимвольное чтение (пайп, IDE-консоль)."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+            ch = msvcrt.getch()
+            if ch in (b"\x00", b"\xe0"):          # префикс спецклавиш
+                c2 = msvcrt.getch()
+                return {b"H": "up", b"P": "down", b"K": "back", b"M": "enter"}.get(c2, "")
+            if ch in (b"\r", b"\n"):
+                return "enter"
+            if ch == b"\x1b":
+                return "esc"
+            if ch == b"\x03":
+                raise KeyboardInterrupt
+            try:
+                return ch.decode("utf-8", "ignore").lower()
+            except Exception:
+                return ""
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                nxt = sys.stdin.read(2)
+                return {"[A": "up", "[B": "down", "[D": "back", "[C": "enter"}.get(nxt, "esc")
+            if ch in ("\r", "\n"):
+                return "enter"
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            return ch.lower()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except (ImportError, OSError, AttributeError):
+        return "fallback"
+
+
+def _menu(title, items, footer=""):
+    """Карточка-меню со стрелками. items = [(ключ, подпись)].
+    Возвращает ключ выбранного пункта или None (Esc / ← назад).
+    В каждой карточке есть выход на предыдущую страницу."""
+    items = list(items) + [("__back__", "← назад")]
+    idx = 0
+    first = True
+    while True:
+        if not first:
+            # поднимаемся на высоту меню и перерисовываем
+            sys.stdout.write(f"\033[{len(items) + 2}A")
+        first = False
+        print(f"\n  {C.B}{title}{C.R}" + (f"  {C.D}{footer}{C.R}" if footer else ""))
+        for i, (_k, label) in enumerate(items):
+            if i == idx:
+                print(f"  {C.GR}❯{C.R} {C.B}{C.CY}{label:<48}{C.R}")
+            else:
+                print(f"    {C.D}{label:<48}{C.R}")
+        k = _getkey()
+        if k == "fallback":                      # терминал без raw-режима
+            print(f"  {C.D}(стрелки недоступны — введи номер){C.R}")
+            for i, (_kk, label) in enumerate(items, 1):
+                print(f"    {i}) {label}")
+            try:
+                ans = input("  номер: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if ans.isdigit() and 1 <= int(ans) <= len(items):
+                key = items[int(ans) - 1][0]
+                return None if key == "__back__" else key
+            return None
+        if k == "up":
+            idx = (idx - 1) % len(items)
+        elif k == "down":
+            idx = (idx + 1) % len(items)
+        elif k in ("esc", "back", "q"):
+            print()
+            return None
+        elif k == "enter":
+            key = items[idx][0]
+            print()
+            return None if key == "__back__" else key
+        elif k.isdigit() and 1 <= int(k) <= len(items):
+            key = items[int(k) - 1][0]
+            print()
+            return None if key == "__back__" else key
+
+
+def _after_gen_menu(cl, path, prompt, params, kind="txt2img", src_b64=None):
+    """Меню после генерации: что делаем с картинкой. Работает стрелками,
+    в каждой карточке есть «← назад» (выход в консоль)."""
+    while True:
+        act = _menu(
+            f"Готово: {os.path.basename(path)}",
+            [
+                ("open", "👁  открыть картинку"),
+                ("again", "🔁 сгенерировать ещё раз (новый seed)"),
+                ("edit", "✏️  переделать эту картинку"),
+                ("tweak", "🎨 поменять промпт и перерисовать"),
+                ("folder", "📂 открыть папку с результатами"),
+                ("copy", "📋 показать путь к файлу"),
+            ],
+            footer="↑↓ выбор · Enter · Esc выход",
+        )
+        if act is None:
+            return 0
+        if act == "open":
+            _open(path)
+        elif act == "folder":
+            _open(os.path.dirname(path))
+        elif act == "copy":
+            print(f"  {C.CY}{path}{C.R}")
+        elif act in ("again", "tweak", "edit"):
+            new_prompt = prompt
+            if act == "tweak":
+                try:
+                    new_prompt = input(f"  новый промпт {C.D}[{prompt[:40]}…]{C.R}: ").strip() or prompt
+                except (EOFError, KeyboardInterrupt):
+                    continue
+            b64 = None
+            new_kind = "txt2img"
+            if act == "edit":
+                try:
+                    instr = input("  что изменить: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    continue
+                if not instr:
+                    continue
+                with open(path, "rb") as fh:
+                    b64 = base64.b64encode(fh.read()).decode()
+                new_prompt, new_kind = instr, "img2img"
+            try:
+                jid = cl.generate(new_kind, new_prompt, image_b64=b64, params=params)
+            except ApiError as e:
+                _err(str(e))
+                continue
+            st, err = _wait(cl, jid, "рисую")
+            if err:
+                _err(err)
+                continue
+            try:
+                path = cl.save_result(jid, new_prompt)
+            except ApiError as e:
+                _err(str(e))
+                continue
+            print(f"{C.GR}✓ {path}{C.R}")
+            prompt = new_prompt
+
+
+def _size_param(val):
+    """Привести размер к тому, что понимает API: число (квадрат) или «WxH».
+
+    Соотношения сторон («9:16») API НЕ понимает — он парсит size как int или WxH,
+    поэтому «9:16» молча превращался в квадрат. Разворачиваем сами. 2026-07-26.
+    """
+    if not val:
+        return None
+    s = str(val).strip().lower().replace(" ", "")
+    ratios = {
+        "9:16": "768x1344",   # вертикаль (сторис)
+        "16:9": "1344x768",   # горизонт (обои)
+        "3:4": "896x1200",
+        "4:3": "1200x896",
+        "2:3": "832x1248",
+        "3:2": "1248x832",
+        "1:1": 1024,
+    }
+    if s in ratios:
+        return ratios[s]
+    if "x" in s:                       # уже WxH — отдаём как есть
+        return s
+    try:
+        return int(float(s))           # число = квадрат
+    except ValueError:
+        return None
+
+
 def _wait(cl, jid, label="генерация"):
     """Ждать джоб, печатая прогресс в одну строку."""
     t0 = time.time()
@@ -159,20 +338,43 @@ def cmd_api_usage(args):
         return _err("неожиданный ответ сервера")
     if info.get("errorCode"):
         return _err(info.get("message") or info["errorCode"])
-    print(f"{C.B}Ключ{C.R} {C.D}{get_key()[:14]}…{C.R}")
+    print(f"\n{C.B}🔑 Ключ{C.R} {C.D}{get_key()[:14]}…{C.R}\n")
     rows = [
         ("владелец", info.get("owner")),
         ("тариф", (f"{info.get('tariff_rub')}₽" if info.get("tariff_rub") else None)),
         ("доступ (scope)", info.get("scope")),
+        ("тип ключа", info.get("use_case")),
         ("истекает", info.get("expires_at_human") or info.get("expires_at")),
-        ("осталось дней", info.get("days_left")),
-        ("лимит в день", info.get("daily_limit")),
-        ("использовано сегодня", info.get("used_today") or info.get("today")),
-        ("всего запросов", info.get("total") or info.get("requests")),
     ]
     for k, v in rows:
         if v not in (None, "", []):
             print(f"  {k:22}: {v}")
+
+    # Срок: сколько дней прожито из купленных + полоска.
+    total_days = info.get("tariff_days")
+    left = info.get("days_left")
+    try:
+        total_days = int(total_days)
+    except (TypeError, ValueError):
+        total_days = None
+    if left == "∞" or (total_days and total_days >= 3650):
+        print(f"  {'срок':22}: {C.GR}♾ навсегда{C.R}")
+    elif total_days and isinstance(left, int):
+        used_days = max(0, total_days - left)
+        print(f"  {'дней использовано':22}: {used_days} из {total_days} "
+              f"{C.D}(осталось {left}){C.R}")
+        print(f"  {'срок':22}: {_bar(used_days, total_days)}")
+    elif left not in (None, ""):
+        print(f"  {'осталось дней':22}: {left}")
+
+    # Дневная квота: расход с полоской.
+    lim = info.get("daily_limit")
+    lim = 0 if lim in ("без лимита", None, "") else lim
+    used = info.get("used_today") or 0
+    print(f"  {'сегодня запросов':22}: {_bar(used, lim)}")
+    if info.get("admin_grant"):
+        print(f"  {'':22}  {C.MA}🛡 админский ключ{C.R}")
+    print()
     return 0
 
 
@@ -181,7 +383,8 @@ def cmd_chat(args):
     if not _need_key():
         return 1
     cl = Client(url=args.url)
-    style = args.style or ""
+    # Персона: флаг --style важнее, иначе берём сохранённую (comfuibot style <имя>).
+    style = args.style or load_config().get("style", "")
     one = " ".join(args.text or []).strip()
     if one:
         try:
@@ -219,8 +422,9 @@ def cmd_photo_gen(args):
     params = {}
     if args.steps:
         params["steps"] = args.steps
-    if args.size:
-        params["size"] = args.size
+    _sz = _size_param(args.size)
+    if _sz is not None:
+        params["size"] = _sz
     try:
         jid = cl.generate("txt2img", prompt, params=params or None)
     except ApiError as e:
@@ -236,6 +440,8 @@ def cmd_photo_gen(args):
     print(f"{C.GR}✓ {path}{C.R}")
     if not args.no_open:
         _open(path)
+        # После генерации — карточка с действиями (стрелки, «← назад»).
+        return _after_gen_menu(cl, path, prompt, params)
     return 0
 
 
@@ -317,6 +523,401 @@ def _coder_once(cl, task):
     return 0
 
 
+# ──────────────────────────── hud ────────────────────────────
+def _bar(used, limit, width=22):
+    """Полоска расхода лимита."""
+    try:
+        used, limit = int(used), int(limit)
+    except (TypeError, ValueError):
+        return ""
+    if limit <= 0:
+        return f"{C.GR}безлимит{C.R}"
+    frac = min(1.0, used / limit)
+    fill = int(frac * width)
+    col = C.GR if frac < 0.6 else (C.YE if frac < 0.9 else C.RD)
+    return f"{col}{'█' * fill}{C.D}{'░' * (width - fill)}{C.R} {used}/{limit}"
+
+
+def cmd_hud(args):
+    """Консольный HUD: одним экраном — сервер, ключ, лимиты, очередь."""
+    cl = Client(url=args.url)
+    W = 54
+    def line(l, r=""):
+        pad = W - len(_strip(l)) - len(_strip(r))
+        print(f"  {l}{' ' * max(1, pad)}{r}")
+
+    print(f"\n{C.MA}{C.B}┌{'─' * (W + 2)}┐{C.R}")
+    print(f"{C.MA}{C.B}│{C.R}  {C.B}comfuibot HUD{C.R}{C.D} · console-side{C.R}"
+          f"{' ' * (W - 29)}{C.MA}{C.B}│{C.R}")
+    print(f"{C.MA}{C.B}└{'─' * (W + 2)}┘{C.R}")
+
+    try:
+        h = cl.health()
+        ok = h.get("status") == "ok"
+        line(f"{'✓' if ok else '✗'} сервер",
+             f"{C.GR if ok else C.RD}{'жив' if ok else 'недоступен'}{C.R}")
+        line("  polling", f"{C.D}{h.get('polling','—')} ({h.get('pollingAgeSec','?')}с){C.R}")
+        up = int(h.get("uptime") or 0)
+        if up:
+            line("  uptime", f"{C.D}{up // 3600}ч {up % 3600 // 60}м{C.R}")
+    except ApiError as e:
+        line("✗ сервер", f"{C.RD}{str(e)[:28]}{C.R}")
+    line("  адрес", f"{C.D}{cl.url}{C.R}")
+
+    if not cl.key:
+        line("✗ ключ", f"{C.YE}нет — comfuibot api auth{C.R}")
+        print()
+        return 0
+    try:
+        i = cl.keyinfo()
+        line("✓ ключ", f"{C.D}{cl.key[:12]}…{C.R}")
+        line("  доступ", f"{C.CY}{i.get('scope','?')}{C.R}")
+        line("  истекает", f"{C.D}{i.get('expires_at_human','—')} "
+                           f"(осталось {i.get('days_left','?')}д){C.R}")
+        lim = i.get("daily_limit")
+        lim = 0 if lim in ("без лимита", None, "") else lim
+        line("  сегодня", _bar(i.get("used_today", 0), lim))
+    except ApiError as e:
+        line("! ключ", f"{C.YE}{str(e)[:30]}{C.R}")
+    print(f"\n  {C.D}команды: chat · photo gen · coder ai · help{C.R}\n")
+    return 0
+
+
+def _strip(s):
+    """Длина строки без ANSI-кодов."""
+    import re
+    return re.sub(r"\033\[[0-9;]*m", "", s)
+
+
+# ──────────────────────────── style ────────────────────────────
+def cmd_style(args):
+    """Выбор персоны чата: список, установка, сброс."""
+    cfg = load_config()
+    cl = Client(url=args.url)
+    if args.name:
+        if args.name in ("off", "-", "нет", "reset"):
+            cfg.pop("style", None)
+            save_config(cfg)
+            print(f"{C.GR}✓ персона сброшена (обычный Газетович){C.R}")
+        else:
+            cfg["style"] = args.name
+            save_config(cfg)
+            print(f"{C.GR}✓ персона: {args.name}{C.R} {C.D}(применится в chat){C.R}")
+        return 0
+    try:
+        items = _fetch_styles(cl)
+    except ApiError as e:
+        return _err(str(e))
+    if not items:
+        return _err("сервер не вернул список персон")
+    cur = cfg.get("style", "")
+    print(f"\n{C.B}🎭 Персоны чата{C.R} {C.D}(сейчас: {cur or 'по умолчанию'}){C.R}\n")
+    for n, (code, label) in enumerate(items, 1):
+        mark = f"{C.GR}●{C.R}" if code == cur else " "
+        print(f"  {mark} {C.CY}{n:>2}{C.R}) {label:<34} {C.D}{code}{C.R}")
+    print(f"\n  {C.D} 0) сбросить на обычного Газетовича{C.R}")
+    # Визард выбора: сразу спрашиваем номер, как «квадратики» в боте.
+    try:
+        ans = input(f"\n  {C.B}выбери номер{C.R} {C.D}(Enter — оставить как есть){C.R}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+    if not ans:
+        print(f"{C.D}без изменений{C.R}")
+        return 0
+    if ans == "0":
+        cfg.pop("style", None)
+        save_config(cfg)
+        print(f"{C.GR}✓ персона сброшена{C.R}")
+        return 0
+    code = None
+    if ans.isdigit() and 1 <= int(ans) <= len(items):
+        code = items[int(ans) - 1][0]
+    else:
+        for c, _l in items:
+            if c == ans.lower():
+                code = c
+                break
+    if not code:
+        return _err(f"нет такой персоны: {ans}")
+    cfg["style"] = code
+    save_config(cfg)
+    label = next((l for c, l in items if c == code), code)
+    print(f"{C.GR}✓ персона: {label}{C.R} {C.D}(применится в comfuibot chat){C.R}")
+    return 0
+
+
+def _fetch_styles(cl):
+    """Список персон с сервера → [(code, label)]. Формат /v1/talk/styles:
+    {"styles":[{"code":"tehpod","label":"🛜 Саппортович (техподдержка)"}, …]}"""
+    st = cl.styles()
+    raw = st.get("styles") or st.get("data") or []
+    out = []
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            out.append((str(k), str(v)))
+    else:
+        for it in raw:
+            if isinstance(it, dict):
+                code = it.get("code") or it.get("id") or it.get("name") or ""
+                label = it.get("label") or it.get("title") or it.get("description") or code
+                if code:
+                    out.append((str(code), str(label)))
+            elif it:
+                out.append((str(it), str(it)))
+    return out
+
+
+# ──────────────────────────── wizard ────────────────────────────
+def _ask(prompt, default="", options=None):
+    """Вопрос визарда: с дефолтом и (опционально) нумерованным списком."""
+    if options:
+        for n, (val, desc) in enumerate(options, 1):
+            print(f"    {C.CY}{n}{C.R}) {val:<14} {C.D}{desc}{C.R}")
+    hint = f" {C.D}[{default}]{C.R}" if default else ""
+    try:
+        ans = input(f"  {prompt}{hint}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise SystemExit(130)
+    if not ans:
+        return default
+    if options and ans.isdigit():
+        i = int(ans) - 1
+        if 0 <= i < len(options):
+            return options[i][0]
+    return ans
+
+
+def cmd_wizard(args):
+    """Визард как в боте: пошагово собираем запрос вместо голого промпта."""
+    if not _need_key():
+        return 1
+    cl = Client(url=args.url)
+    kind = args.what or ""
+    if not kind:
+        print(f"\n{C.MA}{C.B}Визард{C.R} — что делаем?\n")
+        kind = _ask("выбери", "photo", [
+            ("photo", "сгенерировать картинку по шагам"),
+            ("edit", "переделать своё фото"),
+            ("coder", "задача для ИИ-кодера"),
+            ("style", "выбрать персону чата"),
+        ])
+
+    if kind in ("style", "стиль", "4"):
+        return cmd_style(argparse.Namespace(name="", url=args.url))
+
+    if kind in ("photo", "фото", "1"):
+        print(f"\n{C.MA}{C.B}Визард фото{C.R} {C.D}(Enter — оставить значение){C.R}\n")
+        subject = _ask("что рисуем (главный объект)")
+        if not subject:
+            return _err("без описания никак")
+        style = _ask("стиль", "фотореализм", [
+            ("фотореализм", "как фото, детально"),
+            ("кино", "кинокадр, драматичный свет"),
+            ("аниме", "аниме/манга"),
+            ("масло", "живопись маслом"),
+            ("3d", "3D-рендер"),
+            ("киберпанк", "неон, дождь, будущее"),
+        ])
+        light = _ask("свет/время", "золотой час", [
+            ("золотой час", "тёплый закатный свет"),
+            ("ночь", "ночь, огни"),
+            ("студия", "ровный студийный свет"),
+            ("пасмурно", "мягкий рассеянный"),
+        ])
+        ratio = _ask("формат", "1:1", [
+            ("1:1", "квадрат 1024×1024"),
+            ("9:16", "вертикаль 768×1344 (сторис)"),
+            ("16:9", "горизонт 1344×768 (обои)"),
+            ("3:4", "портрет 896×1200"),
+            ("4:3", "альбом 1200×896"),
+        ])
+        steps = _ask("качество (шаги 10-40)", "25")
+        extra = _ask("детали (необязательно)")
+        prompt = f"{subject}, {style}, {light}"
+        if extra:
+            prompt += f", {extra}"
+        _sz = _size_param(ratio) or 1024
+        _wiz_params = {"size": _sz}
+        print(f"\n{C.B}Промпт:{C.R} {C.CY}{prompt}{C.R}")
+        print(f"{C.D}формат {ratio} → {_sz} · шаги {steps}{C.R}")
+        if _ask("рисуем? (y/n)", "y").lower() not in ("y", "yes", "д", "да", ""):
+            print("отменено")
+            return 0
+        params = {"size": _sz}
+        try:
+            params["steps"] = max(1, min(40, int(steps)))
+        except ValueError:
+            pass
+        try:
+            jid = cl.generate("txt2img", prompt, params=params)
+        except ApiError as e:
+            return _err(str(e))
+        print(f"{C.D}job {jid}{C.R}")
+        st, err = _wait(cl, jid, "рисую")
+        if err:
+            return _err(err)
+        path = cl.save_result(jid, subject)
+        print(f"{C.GR}✓ {path}{C.R}")
+        _open(path)
+        return _after_gen_menu(cl, path, prompt, params)
+
+    if kind in ("edit", "правка", "2"):
+        print(f"\n{C.MA}{C.B}Визард правки фото{C.R}\n")
+        src = _ask("путь к файлу")
+        if not src or not os.path.exists(src):
+            return _err(f"нет файла: {src}")
+        what = _ask("что изменить (напр. «сделай зиму», «добавь дождь»)")
+        if not what:
+            return _err("нужно описание правки")
+        print(f"\n{C.B}Инструкция:{C.R} {C.CY}{what}{C.R}")
+        if _ask("делаем? (y/n)", "y").lower() not in ("y", "yes", "д", "да", ""):
+            return 0
+        with open(src, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode()
+        try:
+            jid = cl.generate("img2img", what, image_b64=b64)
+        except ApiError as e:
+            return _err(str(e))
+        st, err = _wait(cl, jid, "переделываю")
+        if err:
+            return _err(err)
+        path = cl.save_result(jid, what)
+        print(f"{C.GR}✓ {path}{C.R}")
+        _open(path)
+        return 0
+
+    if kind in ("coder", "код", "3"):
+        print(f"\n{C.MA}{C.B}Визард кодера{C.R}\n")
+        task = _ask("задача")
+        if not task:
+            return _err("нужна задача")
+        lang = _ask("язык", "любой", [
+            ("любой", "ИИ выберет сам"),
+            ("python", "Python 3"),
+            ("cpp", "C++17 (MSVC)"),
+            ("javascript", "JS/TS через Deno"),
+            ("powershell", "PowerShell"),
+        ])
+        gui = _ask("сделать ГУИ для скрипта? (y/n)", "n")
+        full = task
+        if lang and lang != "любой":
+            full += f". Используй язык: {lang}."
+        if gui.lower() in ("y", "yes", "д", "да"):
+            full += (" Сделай для скрипта простой графический интерфейс (GUI) — "
+                     "на Python это tkinter — и запусти проверку, что он собирается.")
+        return _coder_once(cl, full)
+
+    return _err(f"не знаю режим: {kind}")
+
+
+# ──────────────────────────── help ────────────────────────────
+HELP_TEXT = f"""
+{C.MA}{C.B}comfuibot — console-side bot{C.R}  {C.D}бот в терминале: чат, фото, кодер{C.R}
+
+{C.B}СТАРТ{C.R}
+  {C.CY}comfuibot api auth{C.R}                вставить ключ (получить: бот → /apikey)
+  {C.CY}comfuibot hud{C.R}                     панель: сервер, ключ, лимиты
+  {C.CY}comfuibot wizard{C.R}                  пошаговый мастер (фото / правка / кодер)
+
+{C.B}API{C.R}
+  {C.CY}comfuibot api status{C.R}              жив ли сервер, polling, uptime
+  {C.CY}comfuibot api auth [КЛЮЧ]{C.R}         вставить/сменить ключ
+  {C.CY}comfuibot api usage{C.R}               тариф, срок, лимиты, расход
+
+{C.B}ЧАТ{C.R}
+  {C.CY}comfuibot chat{C.R}                    интерактивный чат ({C.D}/exit — выход{C.R})
+  {C.CY}comfuibot chat "вопрос"{C.R}           одним сообщением
+  {C.CY}comfuibot style{C.R}                   список персон
+  {C.CY}comfuibot style tehpod{C.R}            выбрать персону ({C.D}style off — сброс{C.R})
+
+{C.B}ФОТО{C.R}
+  {C.CY}comfuibot photo gen "промпт"{C.R}      сгенерировать ({C.D}--steps 30 --size 9:16{C.R})
+  {C.CY}comfuibot photo edit ф.png "что"{C.R}  переделать своё фото
+  {C.CY}comfuibot wizard photo{C.R}            мастер: объект → стиль → свет → формат
+
+{C.B}КОДЕР{C.R}
+  {C.CY}comfuibot coder ai "задача"{C.R}       ИИ пишет и {C.B}ЗАПУСКАЕТ{C.R} код, показывает вывод
+  {C.CY}comfuibot coder ai{C.R}                интерактивный режим
+  {C.CY}comfuibot wizard coder{C.R}            мастер: задача → язык → нужен ли ГУИ
+
+{C.B}ПРОЧЕЕ{C.R}
+  {C.CY}comfuibot enter{C.R}                   открыть TG-side бота
+  {C.CY}comfuibot help{C.R}                    эта справка
+  {C.D}--url http://адрес:8090{C.R}            если API не на этой машине
+
+{C.D}Картинки сохраняются в ~/comfuibot-out. Ключ — в ~/.comfuibot/config.json.
+Гео-фильтр: API не работает из Африки, Китая, Ирана, Ирака, Сирии, КНДР,
+Палестины, Мексики, Венесуэлы (403 REGION_BLOCKED).{C.R}
+"""
+
+
+def cmd_help(args):
+    print(HELP_TEXT)
+    return 0
+
+
+# ──────────────────────────── главное меню ────────────────────────────
+def cmd_menu(args):
+    """Интерактивное меню — гуляешь стрелками, как в сервис-менеджерах.
+    Запускается само, если вызвать `comfuibot` без аргументов."""
+    ns = lambda **kw: argparse.Namespace(url=args.url, **kw)  # noqa: E731
+    while True:
+        # шапка со статусом — чтобы было видно, жив ли сервер и есть ли ключ
+        cl = Client(url=args.url)
+        try:
+            h = cl.health()
+            srv = f"{C.GR}online{C.R}" if h.get("status") == "ok" else f"{C.RD}offline{C.R}"
+        except ApiError:
+            srv = f"{C.RD}offline{C.R}"
+        keyst = f"{C.GR}ключ есть{C.R}" if cl.key else f"{C.YE}нет ключа{C.R}"
+
+        act = _menu(
+            "comfuibot — console-side bot",
+            [
+                ("photo", "🖼  Сгенерировать фото"),
+                ("edit", "✏️  Переделать своё фото"),
+                ("chat", "💬 Чат с ИИ"),
+                ("style", "🎭 Выбрать персону чата"),
+                ("coder", "👨‍💻 Кодер: ИИ пишет и запускает код"),
+                ("hud", "📊 HUD — сервер, ключ, лимиты"),
+                ("usage", "📈 Расход по ключу"),
+                ("auth", "🔑 Вставить/сменить ключ"),
+                ("tg", "📱 Открыть TG-side бота"),
+                ("help", "❓ Справка по командам"),
+            ],
+            footer=f"{srv} · {keyst} · ↑↓ Enter · Esc выход",
+        )
+        if act is None:
+            print(f"{C.D}пока!{C.R}")
+            return 0
+        if act == "photo":
+            cmd_wizard(ns(what="photo"))
+        elif act == "edit":
+            cmd_wizard(ns(what="edit"))
+        elif act == "coder":
+            cmd_wizard(ns(what="coder"))
+        elif act == "chat":
+            cmd_chat(ns(text=[], style=""))
+        elif act == "style":
+            cmd_style(ns(name=""))
+        elif act == "hud":
+            cmd_hud(ns())
+        elif act == "usage":
+            cmd_api_usage(ns())
+        elif act == "auth":
+            cmd_api_auth(ns(key=""))
+        elif act == "tg":
+            cmd_enter(ns(no_open=False))
+        elif act == "help":
+            print(HELP_TEXT)
+        try:
+            input(f"\n  {C.D}Enter — назад в меню{C.R} ")
+        except (EOFError, KeyboardInterrupt):
+            return 0
+
+
 # ──────────────────────────── enter ────────────────────────────
 def cmd_enter(args):
     print(f"{C.B}TG-side bot:{C.R} {C.CY}{BOT_LINK}{C.R}")
@@ -378,6 +979,28 @@ def build_parser():
     ai.add_argument("task", nargs="*")
     ai.set_defaults(func=cmd_coder_ai)
 
+    # hud
+    hd = sub.add_parser("hud", help="панель: сервер, ключ, лимиты, расход")
+    hd.set_defaults(func=cmd_hud)
+
+    # style
+    stl = sub.add_parser("style", help="персона чата: список / выбрать / off")
+    stl.add_argument("name", nargs="?", default="")
+    stl.set_defaults(func=cmd_style)
+
+    # wizard
+    wz = sub.add_parser("wizard", help="пошаговый мастер: photo / edit / coder")
+    wz.add_argument("what", nargs="?", default="")
+    wz.set_defaults(func=cmd_wizard)
+
+    # help
+    hp = sub.add_parser("help", help="подробная справка")
+    hp.set_defaults(func=cmd_help)
+
+    # menu — интерактивное меню со стрелками
+    mn = sub.add_parser("menu", help="интерактивное меню (стрелки ↑↓)")
+    mn.set_defaults(func=cmd_menu)
+
     # enter
     en = sub.add_parser("enter", help="открыть TG-side бота")
     en.add_argument("--no-open", action="store_true")
@@ -392,13 +1015,15 @@ def main(argv=None):
     args = p.parse_args(argv)
     func = getattr(args, "func", None)
     if func is None:
-        # группа без действия (напр. просто `comfuibot api`) → покажем помощь группы
-        if getattr(args, "group", None):
-            for act in p._subparsers._group_actions:
-                for name, sp in act.choices.items():
-                    if name == args.group:
-                        sp.print_help()
-                        return 1
+        # Голая команда `comfuibot` → интерактивное меню со стрелками.
+        if not getattr(args, "group", None):
+            return cmd_menu(args)
+        # Группа без действия (напр. `comfuibot api`) → помощь по группе.
+        for act in p._subparsers._group_actions:
+            for name, sp in act.choices.items():
+                if name == args.group:
+                    sp.print_help()
+                    return 1
         p.print_help()
         return 1
     try:
