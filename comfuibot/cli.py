@@ -686,23 +686,23 @@ def _fetch_styles(cl):
 
 # ──────────────────────────── wizard ────────────────────────────
 def _ask(prompt, default="", options=None):
-    """Вопрос визарда: с дефолтом и (опционально) нумерованным списком."""
+    """Шаг визарда. Если есть варианты — выбор СТРЕЛКАМИ (как в меню), иначе
+    обычный ввод текста. Раньше варианты печатались списком и надо было
+    набирать номер — теперь везде единая навигация."""
     if options:
-        for n, (val, desc) in enumerate(options, 1):
-            print(f"    {C.CY}{n}{C.R}) {val:<14} {C.D}{desc}{C.R}")
+        sel = _menu(
+            prompt,
+            [(val, f"{val:<16} {C.D}{desc}{C.R}") for val, desc in options],
+            footer=(f"по умолчанию: {default}" if default else "↑↓ Enter"),
+        )
+        return sel if sel is not None else default
     hint = f" {C.D}[{default}]{C.R}" if default else ""
     try:
         ans = input(f"  {prompt}{hint}: ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         raise SystemExit(130)
-    if not ans:
-        return default
-    if options and ans.isdigit():
-        i = int(ans) - 1
-        if 0 <= i < len(options):
-            return options[i][0]
-    return ans
+    return ans or default
 
 
 def cmd_wizard(args):
@@ -749,7 +749,11 @@ def cmd_wizard(args):
             ("3:4", "портрет 896×1200"),
             ("4:3", "альбом 1200×896"),
         ])
-        steps = _ask("качество (шаги 10-40)", "25")
+        steps = _ask("качество", "25", [
+            ("12", "быстро — черновик"),
+            ("25", "обычное — баланс"),
+            ("35", "лучше — дольше ждать"),
+        ])
         extra = _ask("детали (необязательно)")
         prompt = f"{subject}, {style}, {light}"
         if extra:
@@ -758,7 +762,7 @@ def cmd_wizard(args):
         _wiz_params = {"size": _sz}
         print(f"\n{C.B}Промпт:{C.R} {C.CY}{prompt}{C.R}")
         print(f"{C.D}формат {ratio} → {_sz} · шаги {steps}{C.R}")
-        if _ask("рисуем? (y/n)", "y").lower() not in ("y", "yes", "д", "да", ""):
+        if _ask("рисуем?", "go", [("go", "да, запускай"), ("no", "отмена")]) != "go":
             print("отменено")
             return 0
         params = {"size": _sz}
@@ -788,7 +792,8 @@ def cmd_wizard(args):
         if not what:
             return _err("нужно описание правки")
         print(f"\n{C.B}Инструкция:{C.R} {C.CY}{what}{C.R}")
-        if _ask("делаем? (y/n)", "y").lower() not in ("y", "yes", "д", "да", ""):
+        if _ask("делаем?", "go", [("go", "да, переделывай"), ("no", "отмена")]) != "go":
+            print("отменено")
             return 0
         with open(src, "rb") as fh:
             b64 = base64.b64encode(fh.read()).decode()
@@ -816,11 +821,14 @@ def cmd_wizard(args):
             ("javascript", "JS/TS через Deno"),
             ("powershell", "PowerShell"),
         ])
-        gui = _ask("сделать ГУИ для скрипта? (y/n)", "n")
+        gui = _ask("сделать ГУИ для скрипта?", "no", [
+            ("no", "нет, консольный скрипт"),
+            ("yes", "да, с окошком (tkinter)"),
+        ])
         full = task
         if lang and lang != "любой":
             full += f". Используй язык: {lang}."
-        if gui.lower() in ("y", "yes", "д", "да"):
+        if gui in ("yes", "y", "да"):
             full += (" Сделай для скрипта простой графический интерфейс (GUI) — "
                      "на Python это tkinter — и запусти проверку, что он собирается.")
         return _coder_once(cl, full)
@@ -870,8 +878,113 @@ HELP_TEXT = f"""
 
 
 def cmd_help(args):
-    print(HELP_TEXT)
-    return 0
+    """Справка. В терминале — навигируемая по категориям (стрелки), а не
+    простыня текста: выбрал раздел → выбрал действие → оно сразу запускается.
+    В пайпе/скрипте печатаем обычный текст."""
+    try:
+        interactive = sys.stdin.isatty()
+    except Exception:
+        interactive = False
+    if not interactive or getattr(args, "plain", False):
+        print(HELP_TEXT)
+        return 0
+    return _help_wizard(args)
+
+
+# Разделы справки: (ключ, заголовок, [(действие, подпись, пояснение)])
+_HELP_SECTIONS = [
+    ("photo", "🖼  Фото", [
+        ("wiz_photo", "мастер генерации", "объект → стиль → свет → формат"),
+        ("gen", "photo gen «промпт»", "быстрая генерация одной строкой"),
+        ("wiz_edit", "переделать своё фото", "файл → что изменить"),
+    ]),
+    ("chat", "💬 Чат", [
+        ("chat", "начать чат", "интерактивно, /exit — выход"),
+        ("style", "выбрать персону", "9 персон: Газетович, Саппортович…"),
+    ]),
+    ("coder", "👨‍💻 Кодер", [
+        ("wiz_coder", "мастер задачи", "задача → язык → нужен ли ГУИ"),
+        ("coder", "coder ai «задача»", "ИИ пишет и ЗАПУСКАЕТ код"),
+    ]),
+    ("api", "🔑 Ключ и сервер", [
+        ("hud", "HUD", "сервер, ключ, лимиты одним экраном"),
+        ("usage", "расход по ключу", "тариф, дни, дневная квота"),
+        ("status", "статус сервера", "жив ли, polling, uptime"),
+        ("auth", "сменить ключ", "вставить новый API-ключ"),
+    ]),
+    ("misc", "📱 Прочее", [
+        ("tg", "открыть TG-бота", "там /apikey и генерация в Telegram"),
+        ("plain", "показать текстовую шпаргалку", "все команды списком"),
+        ("geo", "география API", "откуда API не работает"),
+    ]),
+]
+
+
+def _help_wizard(args):
+    ns = lambda **kw: argparse.Namespace(url=args.url, **kw)  # noqa: E731
+    while True:
+        sec = _menu(
+            "❓ Справка — выбери раздел",
+            [(k, title) for k, title, _items in _HELP_SECTIONS],
+            footer="↑↓ Enter · Esc выход",
+        )
+        if sec is None:
+            return 0
+        items = next(i for k, _t, i in _HELP_SECTIONS if k == sec)
+        title = next(t for k, t, _i in _HELP_SECTIONS if k == sec)
+        act = _menu(
+            title,
+            [(a, f"{label:<28} {C.D}{hint}{C.R}") for a, label, hint in items],
+            footer="Enter — выполнить · Esc — к разделам",
+        )
+        if act is None:
+            continue
+        if act == "wiz_photo":
+            cmd_wizard(ns(what="photo"))
+        elif act == "wiz_edit":
+            cmd_wizard(ns(what="edit"))
+        elif act == "wiz_coder":
+            cmd_wizard(ns(what="coder"))
+        elif act == "gen":
+            try:
+                p = input("  промпт: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if p:
+                cmd_photo_gen(ns(prompt=[p], steps=0, size="", no_open=False))
+        elif act == "chat":
+            cmd_chat(ns(text=[], style=""))
+        elif act == "style":
+            cmd_style(ns(name=""))
+        elif act == "coder":
+            try:
+                t = input("  задача: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if t:
+                cmd_coder_ai(ns(task=[t]))
+        elif act == "hud":
+            cmd_hud(ns())
+        elif act == "usage":
+            cmd_api_usage(ns())
+        elif act == "status":
+            cmd_api_status(ns())
+        elif act == "auth":
+            cmd_api_auth(ns(key="", no_menu=True))
+        elif act == "tg":
+            cmd_enter(ns(no_open=False))
+        elif act == "plain":
+            print(HELP_TEXT)
+        elif act == "geo":
+            print(f"\n  {C.B}🌍 География API{C.R}\n"
+                  f"  {C.RD}не работает{C.R}: Африка (все страны), Китай, Иран, Ирак,\n"
+                  f"                Сирия, КНДР, Палестина, Мексика, Венесуэла\n"
+                  f"  {C.GR}работает{C.R}:    Россия, Европа, СНГ, США и остальной мир\n"
+                  f"  {C.D}из заблокированного региона запрос вернёт 403 REGION_BLOCKED{C.R}\n")
+        try:
+            input(f"\n  {C.D}Enter — назад{C.R} ")
+        except (EOFError, KeyboardInterrupt):
+            return 0
 
 
 # ──────────────────────────── главное меню ────────────────────────────
