@@ -222,6 +222,56 @@ def _after_gen_menu(cl, path, prompt, params, kind="txt2img", src_b64=None):
             prompt = new_prompt
 
 
+class _Spinner:
+    """Живой индикатор «модель думает» в одну строку.
+
+    Без него чат/кодер выглядели зависшими: юзер отправил «привет» и смотрит
+    в пустой терминал 10-30 секунд, пока LLM грузится и отвечает. 2026-07-27.
+    """
+
+    FRAMES = "⣾⣽⣻⢿⡿⣟⣯⣷"
+
+    def __init__(self, text="думает"):
+        self.text = text
+        self._stop = None
+        self._th = None
+
+    def __enter__(self):
+        # В пайпе/скрипте анимация превратилась бы в простыню кадров — молчим.
+        try:
+            if not sys.stdout.isatty():
+                print(f"  ⏳ {self.text}…")
+                return self
+        except Exception:
+            return self
+        import threading
+        self._stop = threading.Event()
+
+        def run():
+            i = 0
+            t0 = time.time()
+            while not self._stop.is_set():
+                el = int(time.time() - t0)
+                frame = self.FRAMES[i % len(self.FRAMES)]
+                sys.stdout.write(f"\r  {C.D}{frame} {self.text}… {el}с{C.R}   ")
+                sys.stdout.flush()
+                i += 1
+                self._stop.wait(0.12)
+            sys.stdout.write("\r" + " " * 48 + "\r")
+            sys.stdout.flush()
+
+        self._th = threading.Thread(target=run, daemon=True)
+        self._th.start()
+        return self
+
+    def __exit__(self, *a):
+        if self._stop:
+            self._stop.set()
+        if self._th:
+            self._th.join(timeout=1)
+        return False
+
+
 def _size_param(val):
     """Привести размер к тому, что понимает API: число (квадрат) или «WxH».
 
@@ -404,7 +454,9 @@ def cmd_chat(args):
     one = " ".join(args.text or []).strip()
     if one:
         try:
-            print(f"{C.CY}{cl.talk(one, style=style)}{C.R}")
+            with _Spinner("ИИ думает"):
+                reply = cl.talk(one, style=style)
+            print(f"{C.CY}{reply}{C.R}")
             return 0
         except ApiError as e:
             return _err(str(e))
@@ -422,7 +474,9 @@ def cmd_chat(args):
             print("пока!")
             return 0
         try:
-            print(f"{C.CY}{cl.talk(line, style=style)}{C.R}")
+            with _Spinner("ИИ думает"):
+                reply = cl.talk(line, style=style)
+            print(f"{C.CY}{reply}{C.R}")
         except ApiError as e:
             _err(str(e))
 
@@ -514,9 +568,9 @@ def cmd_coder_ai(args):
 
 
 def _coder_once(cl, task):
-    print(f"{C.D}⏳ ИИ пишет и запускает код…{C.R}")
     try:
-        r = cl.code(task)
+        with _Spinner("ИИ пишет и запускает код"):
+            r = cl.code(task)
     except ApiError as e:
         return _err(str(e))
     langs = r.get("languages") or []
@@ -627,35 +681,23 @@ def cmd_style(args):
     if not items:
         return _err("сервер не вернул список персон")
     cur = cfg.get("style", "")
-    print(f"\n{C.B}🎭 Персоны чата{C.R} {C.D}(сейчас: {cur or 'по умолчанию'}){C.R}\n")
-    for n, (code, label) in enumerate(items, 1):
-        mark = f"{C.GR}●{C.R}" if code == cur else " "
-        print(f"  {mark} {C.CY}{n:>2}{C.R}) {label:<34} {C.D}{code}{C.R}")
-    print(f"\n  {C.D} 0) сбросить на обычного Газетовича{C.R}")
-    # Визард выбора: сразу спрашиваем номер, как «квадратики» в боте.
-    try:
-        ans = input(f"\n  {C.B}выбери номер{C.R} {C.D}(Enter — оставить как есть){C.R}: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return 0
-    if not ans:
+    # Выбор СТРЕЛКАМИ, как везде. Текущая персона помечена точкой.
+    opts = [(code, f"{'● ' if code == cur else '  '}{label:<32} {C.D}{code}{C.R}")
+            for code, label in items]
+    opts.append(("__reset__", "  сбросить на обычного Газетовича"))
+    code = _menu(
+        f"🎭 Персоны чата  {C.D}(сейчас: {cur or 'по умолчанию'}){C.R}",
+        opts,
+        footer="↑↓ Enter · Esc — оставить как есть",
+    )
+    if code is None:
         print(f"{C.D}без изменений{C.R}")
         return 0
-    if ans == "0":
+    if code == "__reset__":
         cfg.pop("style", None)
         save_config(cfg)
         print(f"{C.GR}✓ персона сброшена{C.R}")
         return 0
-    code = None
-    if ans.isdigit() and 1 <= int(ans) <= len(items):
-        code = items[int(ans) - 1][0]
-    else:
-        for c, _l in items:
-            if c == ans.lower():
-                code = c
-                break
-    if not code:
-        return _err(f"нет такой персоны: {ans}")
     cfg["style"] = code
     save_config(cfg)
     label = next((l for c, l in items if c == code), code)
